@@ -26,6 +26,9 @@ from multiprocessing import Pool
 
 def get_identifiers_from_splitted_dataset_folder(folder: str, file_ending: str):
     files = subfiles(folder, suffix=file_ending, join=False)
+    # also check for directories (e.g., .zarr format)
+    dirs = subdirs(folder, suffix=file_ending, join=False)
+    files = files + dirs
     # all files have a 4 digit channel index (_XXXX)
     crop = len(file_ending) + 5
     files = [i[:-crop] for i in files]
@@ -47,9 +50,12 @@ def create_lists_from_splitted_dataset_folder(folder: str, file_ending: str, ide
     if identifiers is None:
         identifiers = get_identifiers_from_splitted_dataset_folder(folder, file_ending)
     files = subfiles(folder, suffix=file_ending, join=False, sort=True)
+    # also check for directories (e.g., .zarr format)
+    dirs = subdirs(folder, suffix=file_ending, join=False, sort=True)
+    files_and_dirs = files + dirs
     list_of_lists = []
 
-    params_list = [(folder, files, file_ending, f) for f in identifiers]
+    params_list = [(folder, files_and_dirs, file_ending, f) for f in identifiers]
     with Pool(processes=num_processes) as pool:
         list_of_lists = pool.starmap(create_paths_fn, params_list)
         

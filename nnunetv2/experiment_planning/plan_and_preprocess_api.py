@@ -131,14 +131,20 @@ def preprocess_dataset(dataset_id: int,
     # copy the gt to a folder in the nnUNet_preprocessed so that we can do validation even if the raw data is no
     # longer there (useful for compute cluster where only the preprocessed data is available)
     from distutils.file_util import copy_file
+    from distutils.dir_util import copy_tree
     maybe_mkdir_p(join(nnUNet_preprocessed, dataset_name, 'gt_segmentations'))
     dataset_json = load_json(join(nnUNet_raw, dataset_name, 'dataset.json'))
     dataset = get_filenames_of_train_images_and_targets(join(nnUNet_raw, dataset_name), dataset_json)
     # only copy files that are newer than the ones already present
     for k in dataset:
-        copy_file(dataset[k]['label'],
-                  join(nnUNet_preprocessed, dataset_name, 'gt_segmentations', k + dataset_json['file_ending']),
-                  update=True)
+        if dataset_json['file_ending'] in ['.zarr']:
+            # we have to copy the entire directory
+            copy_tree(dataset[k]['label'],
+                      join(nnUNet_preprocessed, dataset_name, 'gt_segmentations', k + dataset_json['file_ending']))
+        else:
+            copy_file(dataset[k]['label'],
+                      join(nnUNet_preprocessed, dataset_name, 'gt_segmentations', k + dataset_json['file_ending']),
+                      update=True)
 
 
 def preprocess(dataset_ids: List[int],

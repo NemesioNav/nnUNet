@@ -114,3 +114,16 @@ ENV/
 *.model
 
 !documentation/assets/scribble_example.png
+
+# jobs
+*.sh
+
+# logs
+logs*/
+
+# jupyter notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# temp files
+tmp/
