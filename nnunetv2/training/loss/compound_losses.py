@@ -154,3 +154,77 @@ class DC_and_topk_loss(nn.Module):
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         return result
+
+
+class DC_BCE_and_MSE_loss(nn.Module):
+    """
+    Combined loss for vector field segmentation:
+    - Dice + BCE loss for binary mask (channel 0 of prediction and target)
+    - MSE loss for vector components (channels 1-3 of prediction and target)
+
+    Expected input shapes:
+        net_output: (B, 4, D, H, W) - channel 0: mask logits, channels 1-3: vector predictions
+        target: (B, 4, D, H, W) - channel 0: mask (0 or 1), channels 1-3: vector ground truth
+    """
+
+    def __init__(self, bce_kwargs, soft_dice_kwargs, weight_dice=1, weight_bce=1, weight_mse=1,
+                 apply_mask_to_vectors=True, dice_class=MemoryEfficientSoftDiceLoss):
+        """
+        Args:
+            bce_kwargs: kwargs for BCEWithLogitsLoss
+            soft_dice_kwargs: kwargs for Dice loss
+            weight_dice: weight for Dice loss on mask
+            weight_bce: weight for BCE loss on mask
+            weight_mse: weight for MSE loss on vectors
+            apply_mask_to_vectors: if True, only compute vector MSE where target mask > 0.5
+            dice_class: Dice loss class to use
+        """
+        super().__init__()
+        self.weight_dice = weight_dice
+        self.weight_bce = weight_bce
+        self.weight_mse = weight_mse
+        self.apply_mask_to_vectors = apply_mask_to_vectors
+
+        self.bce = nn.BCEWithLogitsLoss(**bce_kwargs)
+        self.dc = dice_class(apply_nonlin=torch.sigmoid, **soft_dice_kwargs)
+        self.mse = nn.MSELoss(reduction='none')
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        """
+        Args:
+            net_output: (B, 4, D, H, W) - mask logits + vector predictions
+            target: (B, 4, D, H, W) - mask + vector ground truth
+        Returns:
+            Combined loss value
+        """
+        # Split predictions and targets
+        pred_mask = net_output[:, 0:1]  # (B, 1, D, H, W)
+        pred_vectors = net_output[:, 1:4]  # (B, 3, D, H, W)
+
+        target_mask = target[:, 0:1]  # (B, 1, D, H, W)
+        target_vectors = target[:, 1:4]  # (B, 3, D, H, W)
+
+        # Dice loss on mask
+        dc_loss = self.dc(pred_mask, target_mask) if self.weight_dice != 0 else 0
+
+        # BCE loss on mask
+        bce_loss = self.bce(pred_mask, target_mask.float()) if self.weight_bce != 0 else 0
+
+        # MSE loss on vectors
+        if self.weight_mse != 0:
+            if self.apply_mask_to_vectors:
+                # Only compute vector loss where ground truth mask > 0.5 (foreground)
+                fg_mask = (target_mask > 0.5).float()
+                vector_mse = self.mse(pred_vectors, target_vectors)
+                # Apply mask: average over foreground voxels only
+                masked_mse = vector_mse * fg_mask
+                num_fg_voxels = fg_mask.sum()
+                # Average over 3 vector channels and foreground voxels
+                mse_loss = masked_mse.sum() / torch.clip(num_fg_voxels * 3, min=1e-8)
+            else:
+                mse_loss = self.mse(pred_vectors, target_vectors).mean()
+        else:
+            mse_loss = 0
+
+        result = self.weight_dice * dc_loss + self.weight_bce * bce_loss + self.weight_mse * mse_loss
+        return result
