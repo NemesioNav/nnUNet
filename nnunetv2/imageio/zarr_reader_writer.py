@@ -153,6 +153,25 @@ class ZarrIO(BaseReaderWriter):
         )
         
         # Create and write zarr array
-        zarr_array = zarr.open_array(output_fname, mode='w', shape=seg_to_save.shape, 
+        zarr_array = zarr.open_array(output_fname, mode='w', shape=seg_to_save.shape,
                                      dtype=seg_to_save.dtype, chunks=None)
         zarr_array[:] = seg_to_save
+
+    def read_vectors(self, seg_fname: str) -> Tuple[np.ndarray, dict]:
+        """
+        Reads only the vector field channels (xyz) from a 4-channel segmentation zarr array.
+
+        :param seg_fname: Path to the segmentation .zarr directory
+        :return: Tuple of (vector array of shape (3, x, y, z), metadata dict)
+        """
+        seg_array, properties = self.read_images((seg_fname,))
+
+        if seg_array.shape[0] != 4:
+            raise RuntimeError(
+                f"Expected 4-channel segmentation (mask + xyz vectors), "
+                f"got {seg_array.shape[0]} channels. File: {seg_fname}"
+            )
+
+        # Return only channels 1-3 (xyz vectors)
+        vectors = seg_array[1:4]
+        return vectors, properties
