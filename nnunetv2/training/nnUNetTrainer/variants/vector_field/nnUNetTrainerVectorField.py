@@ -16,10 +16,14 @@ Available trainers:
 - nnUNetTrainerVectorField: Safe intensity augmentations only (no spatial)
 """
 
+import multiprocessing
+import warnings
+from time import sleep
 from typing import Union, Tuple, List
 
 import numpy as np
 import torch
+from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p
 from batchgeneratorsv2.helpers.scalar_type import RandomScalar
 from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
 from batchgeneratorsv2.transforms.intensity.brightness import MultiplicativeBrightnessTransform
@@ -34,7 +38,12 @@ from batchgeneratorsv2.transforms.utils.nnunet_masking import MaskImageTransform
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
+from torch import distributed as dist
 
+from nnunetv2.configuration import default_num_processes
+from nnunetv2.inference.export_prediction import export_logits
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.dataloading.vector_field_data_loader import VectorFieldDataLoader
 from nnunetv2.training.loss.compound_losses import DC_BCE_and_MSE_loss
@@ -42,6 +51,7 @@ from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 # from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 # from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnunetv2.utilities.helpers import dummy_context
 
 from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
@@ -260,13 +270,98 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         """
-        Override validation to handle vector field predictions.
-        For now, we only validate the mask channel.
+        Validation for vector field data.
+
+        Saves raw logits for all 4 channels (mask + xyz vectors) as .npz files.
+        Does not compute standard segmentation metrics since ground truth has
+        multiple channels (mask + vectors).
         """
-        # Call parent validation but note that it expects different output format
-        # This may need more customization depending on your needs
-        self.print_to_log_file("Validation: evaluating mask channel only")
-        return super().perform_actual_validation(save_probabilities)
+        self.set_deep_supervision_enabled(False)
+        self.network.eval()
+
+        if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
+            self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
+                                   "encounter crashes in validation then this is because torch.compile forgets "
+                                   "to trigger a recompilation of the model with deep supervision disabled. "
+                                   "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
+                                   "validation with --val (exactly the same as before) and then it will work. "
+                                   "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
+                                   "forward pass (where compile is triggered) already has deep supervision disabled. "
+                                   "This is exactly what we need in perform_actual_validation")
+
+        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+                                    perform_everything_on_device=True, device=self.device, verbose=False,
+                                    verbose_preprocessing=False, allow_tqdm=False)
+        predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+                                        self.dataset_json, self.__class__.__name__,
+                                        self.inference_allowed_mirroring_axes)
+
+        with multiprocessing.get_context("spawn").Pool(default_num_processes) as export_pool:
+            worker_list = [i for i in export_pool._pool]
+            validation_output_folder = join(self.output_folder, 'validation')
+            maybe_mkdir_p(validation_output_folder)
+
+            _, val_keys = self.do_split()
+            if self.is_ddp:
+                last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
+                val_keys = val_keys[self.local_rank:: dist.get_world_size()]
+
+            dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
+                                             folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+
+            results = []
+
+            for i, k in enumerate(dataset_val.identifiers):
+                proceed = not check_workers_alive_and_busy(export_pool, worker_list, results,
+                                                           allowed_num_queued=2)
+                while not proceed:
+                    sleep(0.1)
+                    proceed = not check_workers_alive_and_busy(export_pool, worker_list, results,
+                                                               allowed_num_queued=2)
+
+                self.print_to_log_file(f"predicting {k}")
+                data, _, seg_prev, properties = dataset_val.load_case(k)
+                data = data[:]  # convert blosc2 to numpy
+
+                if self.is_cascaded:
+                    raise NotImplementedError("Cascade training is not supported for vector field data")
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    data = torch.from_numpy(data)
+
+                self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
+                output_filename_truncated = join(validation_output_folder, k)
+
+                prediction = predictor.predict_sliding_window_return_logits(data)
+                prediction = prediction.cpu()
+
+                # Export raw logits for vector field data
+                results.append(
+                    export_pool.starmap_async(
+                        export_logits, (
+                            (prediction, properties, self.configuration_manager, self.plans_manager,
+                             output_filename_truncated, default_num_processes),
+                        )
+                    )
+                )
+
+                if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+                    dist.barrier()
+
+            _ = [r.get() for r in results]
+
+        if self.is_ddp:
+            dist.barrier()
+
+        if self.local_rank == 0:
+            self.print_to_log_file("Validation complete", also_print_to_console=True)
+            self.print_to_log_file(f"Predictions saved to {validation_output_folder}", also_print_to_console=True)
+            self.print_to_log_file("Note: Standard Dice metrics not computed for vector field data.",
+                                   also_print_to_console=True)
+
+        self.set_deep_supervision_enabled(True)
+        compute_gaussian.cache_clear()
 
 
 class nnUNetTrainerVectorField(nnUNetTrainerVectorFieldNoDA):

@@ -147,3 +147,27 @@ def resample_and_save(predicted: Union[torch.Tensor, np.ndarray], target_shape: 
     else:
         dataset_class.save_seg(segmentation.astype(dtype=np.uint8 if len(label_manager.foreground_labels) < 255 else np.uint16), output_file)
     torch.set_num_threads(old_threads)
+
+def export_logits(predicted: Union[torch.Tensor, np.ndarray], target_shape: List[int], output_file: str,
+                  plans_manager: PlansManager, configuration_manager: ConfigurationManager, properties_dict: dict,
+                  dataset_json_dict_or_file: Union[dict, str], num_threads_torch: int = default_num_processes,
+                  dataset_class=None) \
+        -> None:
+
+    if predicted.shape[1:] != target_shape:
+        print("Predicted shape:", predicted.shape
+              , "target shape:", target_shape)
+        raise NotImplementedError("export_logits does not support resampling yet.")
+    
+    old_threads = torch.get_num_threads()
+    torch.set_num_threads(num_threads_torch)
+
+    if isinstance(predicted, torch.Tensor):
+        predicted = predicted.cpu().numpy()
+
+    if dataset_class is None:
+        nnUNetDatasetBlosc2.save_seg(predicted.astype(dtype=np.float32), output_file)
+    else:
+        dataset_class.save_seg(predicted.astype(dtype=np.float32), output_file)
+
+    torch.set_num_threads(old_threads)
