@@ -40,7 +40,13 @@ from nnunetv2.training.dataloading.vector_field_data_loader import VectorFieldDa
 from nnunetv2.training.loss.compound_losses import DC_BCE_and_MSE_loss
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+# from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
+# from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from nnunetv2.utilities.helpers import dummy_context
+
+from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+# from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 
 
 class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
@@ -88,8 +94,6 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
         if not self.was_initialized:
             self._set_batch_size_and_oversample()
 
-            from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
-
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                     self.dataset_json)
 
@@ -116,6 +120,7 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
                 torch.cuda.empty_cache()
 
             self.loss = self._build_loss()
+            self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
             self.was_initialized = True
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
@@ -198,35 +203,24 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
         # No augmenter wrapping needed since we're using no DA
         return dl_tr, dl_val
 
-    def train_step(self, batch: dict) -> dict:
-        """Training step with vector field data."""
-        data = batch['data']
-        target = batch['target']
+        # allowed_num_processes = get_allowed_n_proc_DA()
+        # if allowed_num_processes == 0:
+        #     mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
+        #     mt_gen_val = SingleThreadedAugmenter(dl_val, None)
+        # else:
+        #     mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
+        #                                                 num_processes=allowed_num_processes,
+        #                                                 num_cached=max(6, allowed_num_processes // 2), seeds=None,
+        #                                                 pin_memory=self.device.type == 'cuda', wait_time=0.002)
+        #     mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
+        #                                               transform=None, num_processes=max(1, allowed_num_processes // 2),
+        #                                               num_cached=max(3, allowed_num_processes // 4), seeds=None,
+        #                                               pin_memory=self.device.type == 'cuda',
+        #                                               wait_time=0.002)
 
-        data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-
-        return {'loss': loss.detach().cpu().numpy()}
+        # _ = next(mt_gen_train)
+        # _ = next(mt_gen_val)
+        # return mt_gen_train, mt_gen_val
 
     def validation_step(self, batch: dict) -> dict:
         """Validation step - compute loss and mask Dice."""
