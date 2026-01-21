@@ -440,3 +440,17 @@ class nnUNetTrainerVectorField(nnUNetTrainerVectorFieldNoDA):
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
 
         return ComposeTransforms(transforms)
+
+
+class nnUNetTrainerVectorField100epochs(nnUNetTrainerVectorField):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 100
+
+
+class nnUNetTrainerVectorFieldNoDA100epochs(nnUNetTrainerVectorFieldNoDA):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 100
