@@ -24,7 +24,7 @@ from nnunetv2.configuration import default_num_processes
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
     preprocessing_iterator_fromnpy
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, \
-    convert_predicted_logits_to_segmentation_with_correct_shape, export_logits
+    convert_predicted_logits_to_segmentation_with_correct_shape, export_prediction
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian, \
     compute_steps_for_sliding_window
 from nnunetv2.utilities.file_path_utilities import get_output_folder, check_workers_alive_and_busy
@@ -390,7 +390,7 @@ class nnUNetPredictor(object):
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.starmap_async(
-                            export_logits,
+                            export_prediction,
                             ((prediction, ofile),)
                         )
                     )
