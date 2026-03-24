@@ -24,7 +24,7 @@ from nnunetv2.configuration import default_num_processes
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
     preprocessing_iterator_fromnpy
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, \
-    convert_predicted_logits_to_segmentation_with_correct_shape
+    convert_predicted_logits_to_segmentation_with_correct_shape, export_logits
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian, \
     compute_steps_for_sliding_window
 from nnunetv2.utilities.file_path_utilities import get_output_folder, check_workers_alive_and_busy
@@ -101,12 +101,13 @@ class nnUNetPredictor(object):
         if trainer_class is None:
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
                                f'Please place it there (in any .py file)!')
+        num_output_channels = checkpoint['network_weights']['decoder.seg_layers.0.weight'].shape[0]
         network = trainer_class.build_network_architecture(
             configuration_manager.network_arch_class_name,
             configuration_manager.network_arch_init_kwargs,
             configuration_manager.network_arch_init_kwargs_req_import,
             num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+            num_output_channels,
             enable_deep_supervision=False
         )
 
@@ -389,9 +390,8 @@ class nnUNetPredictor(object):
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.starmap_async(
-                            export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                            export_logits,
+                            ((prediction, ofile),)
                         )
                     )
                 else:

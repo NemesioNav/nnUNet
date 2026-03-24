@@ -23,6 +23,9 @@ from typing import Union, Tuple, List
 
 import numpy as np
 import torch
+from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p
 from batchgeneratorsv2.helpers.scalar_type import RandomScalar
 from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
@@ -33,7 +36,7 @@ from batchgeneratorsv2.transforms.intensity.gaussian_noise import GaussianNoiseT
 from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransform
 from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResolutionTransform
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
-from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform
+from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform, DownsampleVesselposeDSTransform
 from batchgeneratorsv2.transforms.utils.nnunet_masking import MaskImageTransform
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
@@ -41,16 +44,18 @@ from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentatio
 from torch import distributed as dist
 
 from nnunetv2.configuration import default_num_processes
-from nnunetv2.inference.export_prediction import export_logits
+from nnunetv2.inference.export_prediction import export_prediction, export_prediction_from_logits
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 from nnunetv2.training.dataloading.vector_field_data_loader import VectorFieldDataLoader
 from nnunetv2.training.loss.compound_losses import DC_BCE_and_MSE_loss
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 # from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 # from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnunetv2.utilities.helpers import dummy_context
 
@@ -72,32 +77,7 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
         super().__init__(plans, configuration, fold, dataset_json, device)
         # We output 4 channels: 1 for mask + 3 for vectors
         self.num_vector_channels = 3
-
-    @staticmethod
-    def get_training_transforms(
-            patch_size: Union[np.ndarray, Tuple[int]],
-            rotation_for_DA: RandomScalar,
-            deep_supervision_scales: Union[List, Tuple, None],
-            mirror_axes: Tuple[int, ...],
-            do_dummy_2d_data_aug: bool,
-            use_mask_for_norm: List[bool] = None,
-            is_cascaded: bool = False,
-            foreground_labels: Union[Tuple[int, ...], List[int]] = None,
-            regions: List[Union[List[int], Tuple[int, ...], int]] = None,
-            ignore_label: int = None,
-    ) -> BasicTransform:
-        """No data augmentation - use validation transforms for training."""
-        return nnUNetTrainer.get_validation_transforms(deep_supervision_scales, is_cascaded, foreground_labels,
-                                                       regions, ignore_label)
-
-    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
-        """Disable mirroring for inference as well."""
-        rotation_for_DA, do_dummy_2d_data_aug, _, _ = \
-            super().configure_rotation_dummyDA_mirroring_and_inital_patch_size()
-        mirror_axes = None
-        self.inference_allowed_mirroring_axes = None
-        initial_patch_size = self.configuration_manager.patch_size
-        return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
+        self.num_iterations_per_epoch = 300
 
     def initialize(self):
         """Override to use custom number of output channels."""
@@ -145,7 +125,7 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
             weight_dice=1.0,
             weight_bce=1.0,
             weight_mse=1.0,
-            apply_mask_to_vectors=True,
+            bg_vector_weight=0.1,
             dice_class=MemoryEfficientSoftDiceLoss
         )
 
@@ -161,9 +141,17 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
 
         return loss
 
+    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
+        """Disable mirroring for inference as well."""
+        rotation_for_DA, do_dummy_2d_data_aug, _, _ = \
+            super().configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        mirror_axes = None
+        self.inference_allowed_mirroring_axes = None
+        initial_patch_size = self.configuration_manager.patch_size
+        return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
+
     def get_dataloaders(self):
         """Override to use VectorFieldDataLoader."""
-        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
@@ -183,14 +171,16 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
             use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
             is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
             regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label)
+            ignore_label=self.label_manager.ignore_label,
+            downsample_vectors_method=self.downsample_vectors_method)
 
         val_transforms = self.get_validation_transforms(deep_supervision_scales,
                                                         is_cascaded=self.is_cascaded,
                                                         foreground_labels=self.label_manager.foreground_labels,
                                                         regions=self.label_manager.foreground_regions if
                                                         self.label_manager.has_regions else None,
-                                                        ignore_label=self.label_manager.ignore_label)
+                                                        ignore_label=self.label_manager.ignore_label,
+                                                        downsample_vectors_method=self.downsample_vectors_method)
 
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
@@ -210,27 +200,64 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
                                         sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
                                         probabilistic_oversampling=self.probabilistic_oversampling)
 
-        # No augmenter wrapping needed since we're using no DA
-        return dl_tr, dl_val
+        allowed_num_processes = get_allowed_n_proc_DA()
+        if allowed_num_processes == 0:
+            mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
+            mt_gen_val = SingleThreadedAugmenter(dl_val, None)
+        else:
+            mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
+                                                        num_processes=allowed_num_processes,
+                                                        num_cached=max(6, allowed_num_processes // 2), seeds=None,
+                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
+            mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
+                                                      transform=None, num_processes=max(1, allowed_num_processes // 2),
+                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                                                      pin_memory=self.device.type == 'cuda',
+                                                      wait_time=0.002)
 
-        # allowed_num_processes = get_allowed_n_proc_DA()
-        # if allowed_num_processes == 0:
-        #     mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        #     mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        # else:
-        #     mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
-        #                                                 num_processes=allowed_num_processes,
-        #                                                 num_cached=max(6, allowed_num_processes // 2), seeds=None,
-        #                                                 pin_memory=self.device.type == 'cuda', wait_time=0.002)
-        #     mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
-        #                                               transform=None, num_processes=max(1, allowed_num_processes // 2),
-        #                                               num_cached=max(3, allowed_num_processes // 4), seeds=None,
-        #                                               pin_memory=self.device.type == 'cuda',
-        #                                               wait_time=0.002)
+        _ = next(mt_gen_train)
+        _ = next(mt_gen_val)
+        return mt_gen_train, mt_gen_val
 
-        # _ = next(mt_gen_train)
-        # _ = next(mt_gen_val)
-        # return mt_gen_train, mt_gen_val
+    @staticmethod
+    def get_training_transforms(
+            patch_size: Union[np.ndarray, Tuple[int]],
+            rotation_for_DA: RandomScalar,
+            deep_supervision_scales: Union[List, Tuple, None],
+            mirror_axes: Tuple[int, ...],
+            do_dummy_2d_data_aug: bool,
+            use_mask_for_norm: List[bool] = None,
+            is_cascaded: bool = False,
+            foreground_labels: Union[Tuple[int, ...], List[int]] = None,
+            regions: List[Union[List[int], Tuple[int, ...], int]] = None,
+            ignore_label: int = None,
+            downsample_vectors_method: str = 'nearest',
+    ) -> BasicTransform:
+        """No data augmentation - use validation transforms for training."""
+        return nnUNetTrainerVectorFieldNoDA.get_validation_transforms(deep_supervision_scales, is_cascaded, foreground_labels,
+                                                       regions, ignore_label, downsample_vectors_method)
+
+    @staticmethod
+    def get_validation_transforms(
+            deep_supervision_scales: Union[List, Tuple, None],
+            is_cascaded: bool = False,
+            foreground_labels: Union[Tuple[int, ...], List[int]] = None,
+            regions: List[Union[List[int], Tuple[int, ...], int]] = None,
+            ignore_label: int = None,
+            downsample_vectors_method: str = 'nearest',
+    ) -> BasicTransform:
+        transforms = []
+
+        transforms.append(
+            RemoveLabelTansform(label_value=-1, set_to=0, segmentation_channels=[0])
+        )
+
+        if deep_supervision_scales is not None:
+            if downsample_vectors_method == 'avg_pool':
+                transforms.append(DownsampleVesselposeDSTransform(ds_scales=deep_supervision_scales))
+            elif downsample_vectors_method == 'nearest':
+                transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
+        return ComposeTransforms(transforms)
 
     def validation_step(self, batch: dict) -> dict:
         """Validation step - compute loss and mask Dice."""
@@ -309,6 +336,10 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
             dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
                                              folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
 
+            next_stages = self.configuration_manager.next_stage_names
+            if next_stages is not None:
+                raise NotImplementedError("Cascade training is not supported for vector field data")
+
             results = []
 
             for i, k in enumerate(dataset_val.identifiers):
@@ -339,9 +370,9 @@ class nnUNetTrainerVectorFieldNoDA(nnUNetTrainer):
                 # Export raw logits for vector field data
                 results.append(
                     export_pool.starmap_async(
-                        export_logits, (
-                            (prediction, properties, self.configuration_manager, self.plans_manager,
-                             output_filename_truncated, default_num_processes),
+                        export_prediction, (
+                            (prediction, output_filename_truncated,
+                             default_num_processes, self.dataset_class),
                         )
                     )
                 )
@@ -395,121 +426,82 @@ class nnUNetTrainerVectorField(nnUNetTrainerVectorFieldNoDA):
             foreground_labels: Union[Tuple[int, ...], List[int]] = None,
             regions: List[Union[List[int], Tuple[int, ...], int]] = None,
             ignore_label: int = None,
+            downsample_vectors_method: str = 'nearest',
     ) -> BasicTransform:
         """
         Training transforms with safe intensity augmentations only.
         No spatial augmentations (rotation, mirroring, etc.) that would break vectors.
         """
         transforms = []
+        transforms.append(RandomTransform(
+            GaussianNoiseTransform(
+                noise_variance=(0, 0.1),
+                p_per_channel=1,
+                synchronize_channels=True
+            ), apply_probability=0.1
+        ))
+        transforms.append(RandomTransform(
+            GaussianBlurTransform(
+                blur_sigma=(0.5, 1.),
+                synchronize_channels=False,
+                synchronize_axes=False,
+                p_per_channel=0.5,
+            ), apply_probability=0.2
+        ))
+        transforms.append(RandomTransform(
+            MultiplicativeBrightnessTransform(
+                multiplier_range=BGContrast((0.75, 1.25)),
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.15
+        ))
+        transforms.append(RandomTransform(
+            ContrastTransform(
+                contrast_range=BGContrast((0.75, 1.25)),
+                preserve_range=True,
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.15
+        ))
+        transforms.append(RandomTransform(
+            SimulateLowResolutionTransform(
+                scale=(0.5, 1),
+                synchronize_channels=False,
+                synchronize_axes=True,
+                ignore_axes=None,
+                allowed_channels=None,
+                p_per_channel=0.5
+            ), apply_probability=0.25
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=1,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.1
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=0,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.3
+        ))
 
-        # === SAFE INTENSITY AUGMENTATIONS ===
-        # (No spatial transforms - they would break vector directions)
-
-        # Gaussian Noise
-        transforms.append(
-            RandomTransform(
-                GaussianNoiseTransform(
-                    noise_variance=(0, 0.1),
-                    p_per_channel=1,
-                    synchronize_channels=True
-                ),
-                apply_probability=0.1
-            )
-        )
-
-        # Gaussian Blur
-        transforms.append(
-            RandomTransform(
-                GaussianBlurTransform(
-                    blur_sigma=(0.5, 1.),
-                    synchronize_channels=False,
-                    synchronize_axes=False,
-                    p_per_channel=0.5,
-                ),
-                apply_probability=0.2
-            )
-        )
-
-        # Brightness
-        transforms.append(
-            RandomTransform(
-                MultiplicativeBrightnessTransform(
-                    multiplier_range=BGContrast((0.75, 1.25)),
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ),
-                apply_probability=0.15
-            )
-        )
-
-        # Contrast
-        transforms.append(
-            RandomTransform(
-                ContrastTransform(
-                    contrast_range=BGContrast((0.75, 1.25)),
-                    preserve_range=True,
-                    synchronize_channels=False,
-                    p_per_channel=1
-                ),
-                apply_probability=0.15
-            )
-        )
-
-        # Simulate Low Resolution
-        transforms.append(
-            RandomTransform(
-                SimulateLowResolutionTransform(
-                    scale=(0.5, 1),
-                    synchronize_channels=False,
-                    synchronize_axes=True,
-                    ignore_axes=None,
-                    allowed_channels=None,
-                    p_per_channel=0.5
-                ),
-                apply_probability=0.25
-            )
-        )
-
-        # Gamma Transform (two variants like in default nnUNet)
-        transforms.append(
-            RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=1,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ),
-                apply_probability=0.1
-            )
-        )
-        transforms.append(
-            RandomTransform(
-                GammaTransform(
-                    gamma=BGContrast((0.7, 1.5)),
-                    p_invert_image=0,
-                    synchronize_channels=False,
-                    p_per_channel=1,
-                    p_retain_stats=1
-                ),
-                apply_probability=0.3
-            )
-        )
-
-        # === END INTENSITY AUGMENTATIONS ===
-
-        # Mask normalization if needed (before RemoveLabelTransform)
         if use_mask_for_norm is not None and any(use_mask_for_norm):
-            transforms.append(
-                MaskImageTransform(
-                    apply_to_channels=[i for i in range(len(use_mask_for_norm)) if use_mask_for_norm[i]],
-                    channel_idx_in_seg=0,
-                    set_outside_to=0
-                )
-            )
+            transforms.append(MaskImageTransform(
+                apply_to_channels=[i for i in range(len(use_mask_for_norm)) if use_mask_for_norm[i]],
+                channel_idx_in_seg=0,
+                set_outside_to=0
+            ))
 
-        # Remove label transform (after augmentations, before region conversion)
-        transforms.append(RemoveLabelTansform(-1, 0))
+        transforms.append(
+            RemoveLabelTansform(label_value=-1, set_to=0, segmentation_channels=[0])
+        )
 
         # Note: Cascade not supported for vector field data
         if is_cascaded:
@@ -526,7 +518,10 @@ class nnUNetTrainerVectorField(nnUNetTrainerVectorFieldNoDA):
 
         # Deep supervision downsampling
         if deep_supervision_scales is not None:
-            transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
+            if downsample_vectors_method == 'avg_pool':
+                transforms.append(DownsampleVesselposeDSTransform(ds_scales=deep_supervision_scales))
+            elif downsample_vectors_method == 'nearest':
+                transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
 
         return ComposeTransforms(transforms)
 
@@ -538,8 +533,28 @@ class nnUNetTrainerVectorField100epochs(nnUNetTrainerVectorField):
         self.num_epochs = 100
 
 
+class nnUNetTrainerVectorField5epochs(nnUNetTrainerVectorField):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 5
+
+
 class nnUNetTrainerVectorFieldNoDA100epochs(nnUNetTrainerVectorFieldNoDA):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 100
+
+
+class nnUNetTrainerVectorFieldNoDA5epochs(nnUNetTrainerVectorFieldNoDA):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 5
+
+class nnUNetTrainerVectorField300ipe(nnUNetTrainerVectorField):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_iterations_per_epoch = 300

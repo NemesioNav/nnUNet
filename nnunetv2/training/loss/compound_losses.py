@@ -168,7 +168,7 @@ class DC_BCE_and_MSE_loss(nn.Module):
     """
 
     def __init__(self, bce_kwargs, soft_dice_kwargs, weight_dice=1, weight_bce=1, weight_mse=1,
-                 apply_mask_to_vectors=True, dice_class=MemoryEfficientSoftDiceLoss):
+                 bg_vector_weight=0.1, dice_class=MemoryEfficientSoftDiceLoss):
         """
         Args:
             bce_kwargs: kwargs for BCEWithLogitsLoss
@@ -183,7 +183,7 @@ class DC_BCE_and_MSE_loss(nn.Module):
         self.weight_dice = weight_dice
         self.weight_bce = weight_bce
         self.weight_mse = weight_mse
-        self.apply_mask_to_vectors = apply_mask_to_vectors
+        self.bg_vector_weight = bg_vector_weight
 
         self.bce = nn.BCEWithLogitsLoss(**bce_kwargs)
         self.dc = dice_class(apply_nonlin=torch.sigmoid, **soft_dice_kwargs)
@@ -211,16 +211,15 @@ class DC_BCE_and_MSE_loss(nn.Module):
         bce_loss = self.bce(pred_mask, target_mask.float()) if self.weight_bce != 0 else 0
 
         # MSE loss on vectors
-        if self.weight_mse != 0:
-            if self.apply_mask_to_vectors:
-                # Only compute vector loss where ground truth mask > 0.5 (foreground)
+        if self.weight_mse != 0.0:
+            if self.bg_vector_weight != 1.0:
+                # Create the soft background penalty weight map
                 fg_mask = (target_mask > 0.5).float()
-                vector_mse = self.mse(pred_vectors, target_vectors)
-                # Apply mask: average over foreground voxels only
-                masked_mse = vector_mse * fg_mask
-                num_fg_voxels = fg_mask.sum()
-                # Average over 3 vector channels and foreground voxels
-                mse_loss = masked_mse.sum() / torch.clip(num_fg_voxels * 3, min=1e-8)
+                weight_map = fg_mask * 1.0 + (1.0 - fg_mask) * self.bg_vector_weight
+                
+                # Calculate squared error, apply weights, and average over the whole volume
+                sq_error = (pred_vectors - target_vectors) ** 2
+                mse_loss = (weight_map * sq_error).sum() / weight_map.sum()
             else:
                 mse_loss = self.mse(pred_vectors, target_vectors).mean()
         else:

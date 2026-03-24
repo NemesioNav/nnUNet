@@ -151,6 +151,12 @@ class nnUNetTrainer(object):
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
+        self.downsample_vectors_method = None
+        if self.enable_deep_supervision:
+            if isinstance(self.fold, int) and self.fold < 6:
+                self.downsample_vectors_method = 'nearest'
+            else:
+                self.downsample_vectors_method = 'avg_pool'
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -196,6 +202,7 @@ class nnUNetTrainer(object):
                                "Nature methods, 18(2), 203-211.\n"
                                "#######################################################################\n",
                                also_print_to_console=True, add_timestamp=False)
+        self.print_to_log_file(f"Downsample vectors method: {self.downsample_vectors_method}")
 
     def initialize(self):
         if not self.was_initialized:
@@ -562,7 +569,7 @@ class nnUNetTrainer(object):
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
-        if self.fold == "all":
+        if True:
             # if fold==all then we use all images for training and validation
             case_identifiers = self.dataset_class.get_identifiers(self.preprocessed_dataset_folder)
             tr_keys = case_identifiers
