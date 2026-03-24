@@ -8,6 +8,7 @@ from typing import List, Union, Type, Tuple
 import numpy as np
 import blosc2
 import shutil
+import tifffile
 from blosc2 import Filter, Codec
 
 from batchgenerators.utilities.file_and_folder_operations import join, load_pickle, isfile, write_pickle, subfiles
@@ -189,7 +190,8 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
             chunks_seg=None,
             blocks_seg=None
     ):
-        blosc2.asarray(seg, urlpath=output_filename_truncated + '.b2nd', chunks=chunks_seg, blocks=blocks_seg)
+        # blosc2.asarray(seg, urlpath=output_filename_truncated + '.b2nd', chunks=chunks_seg, blocks=blocks_seg)
+        tifffile.imwrite(output_filename_truncated + '.tif', seg)
 
     @staticmethod
     def get_identifiers(folder: str) -> List[str]:
